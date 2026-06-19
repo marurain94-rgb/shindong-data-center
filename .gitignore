@@ -9,6 +9,7 @@ ingest_skills.py
 # 공개 인스턴스 데이터 + 실행 스크립트(비밀번호 포함) — 절대 푸시 금지
 public_data/
 start_public.bat
+RESUME.md
 
 # 파이썬 캐시
 __pycache__/
