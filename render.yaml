@@ -1,0 +1,22 @@
+# Render Blueprint — Shindong Data Center
+# Render 대시보드 > Blueprints > 이 저장소 연결 시 자동 적용됩니다.
+services:
+  - type: web
+    name: shindong-data-center        # → https://shindong-data-center.onrender.com
+    runtime: python
+    plan: starter                     # 영구 디스크(disk)는 유료 플랜에서만 가능. 무료로 테스트하려면 plan:free + disk 블록 삭제
+    buildCommand: ""                  # 외부 의존성 없음 (표준 라이브러리만)
+    startCommand: python server.py
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /data
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: DC_PASSWORD
+        sync: false                   # 대시보드에서 직접 비밀번호 입력 (Git에 저장 안 됨)
+    disk:
+      name: data
+      mountPath: /data                # 업로드 파일 + SQLite 영구 보존
+      sizeGB: 1

@@ -1,0 +1,16 @@
+# 로컬 데이터 — 절대 배포/푸시 금지 (자격증명 포함 가능)
+storage/
+*.db
+datacenter.db
+
+# 로컬 전용 유틸 (내 PC의 .claude 자격증명에 접근)
+ingest_skills.py
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 기타 민감/임시
+secrets*
+.env
+*.local
