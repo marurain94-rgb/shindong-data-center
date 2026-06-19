@@ -6,6 +6,10 @@ datacenter.db
 # 로컬 전용 유틸 (내 PC의 .claude 자격증명에 접근)
 ingest_skills.py
 
+# 공개 인스턴스 데이터 + 실행 스크립트(비밀번호 포함) — 절대 푸시 금지
+public_data/
+start_public.bat
+
 # 파이썬 캐시
 __pycache__/
 *.pyc
