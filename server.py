@@ -16,6 +16,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import hf_sync  # 선택적 HF Dataset 백업(미설정 시 모든 호출이 no-op)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 영구 디스크가 있는 PaaS에서는 DATA_DIR 환경변수로 저장 위치를 지정 (예: /data)
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
@@ -387,6 +389,11 @@ class Handler(BaseHTTPRequestHandler):
         conn.commit()
         new_id = cur.lastrowid
         conn.close()
+        # 영구 백업: 새 파일 + 갱신된 DB를 한 커밋으로 반영
+        hf_sync.commit(
+            adds=[(stored_path, f"storage/{stored_name}"), (DB_PATH, "datacenter.db")],
+            msg=f"upload: {filename}",
+        )
         return self._send_json({"ok": True, "id": new_id})
 
     def api_update(self, item_id, qs):
@@ -415,6 +422,8 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute(f"UPDATE items SET {sets} WHERE id=?", params)
         conn.commit()
         conn.close()
+        # 메타데이터만 바뀌므로 DB만 백업
+        hf_sync.commit(adds=[(DB_PATH, "datacenter.db")], msg=f"update: #{item_id}")
         return self._send_json({"ok": True})
 
     def api_file(self, item_id, inline):
@@ -450,17 +459,29 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("DELETE FROM items WHERE id=?", (item_id,))
         conn.commit()
         conn.close()
+        # 영구 백업: 원격 파일 삭제 + 갱신된 DB를 한 커밋으로 반영
+        hf_sync.commit(
+            adds=[(DB_PATH, "datacenter.db")],
+            deletes=[f"storage/{row['stored_name']}"],
+            msg=f"delete: #{item_id}",
+        )
         return self._send_json({"ok": True})
 
 
 def main():
+    # 백업이 켜져 있으면(클라우드) 기존 DB/파일을 먼저 복원한 뒤 DB 초기화
+    if hf_sync.enabled():
+        hf_sync.ensure_repo()
+        hf_sync.restore(DATA_DIR)
+        os.makedirs(STORAGE_DIR, exist_ok=True)
     init_db()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
     print("=" * 50)
-    print("  데이터 센터 클라우드 (로컬)")
+    print("  데이터 센터 클라우드")
     print(f"  주소: {url}")
     print(f"  저장 위치: {STORAGE_DIR}")
+    print(f"  영구 백업: {'ON (' + hf_sync.HF_REPO_ID + ')' if hf_sync.enabled() else 'OFF (로컬 전용)'}")
     print("  종료: Ctrl+C")
     print("=" * 50)
     try:

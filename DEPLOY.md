@@ -21,6 +21,48 @@
 
 ---
 
+## 방법 ★. Hugging Face Spaces (카드 없이 24시간 무료 + 영구 백업) — 추천
+
+신용카드 없이 PC를 꺼도 24시간 떠 있는 무료 방법입니다. 휘발성 디스크 문제는
+**비공개 HF Dataset 자동 백업**(`hf_sync.py`)으로 해결합니다.
+
+**준비물**: 무료 HF 계정 1개(카드 X). 끝.
+
+1. **HF 가입 + 토큰 발급**
+   - https://huggingface.co 가입 → 우상단 프로필 → **Settings → Access Tokens**
+   - **New token** → 이름 자유, 권한 **Write** → 생성된 `hf_...` 토큰 복사.
+
+2. **백업용 Dataset 만들기** (선택 — Space가 자동 생성하지만 미리 만들어도 됨)
+   - **New → Dataset** → 이름 예 `shindong-dc-data`, **Private** 체크.
+   - 저장소 ID는 `사용자명/shindong-dc-data` 형태 → 이게 `HF_REPO_ID`.
+
+3. **Space 만들기**
+   - **New → Space** → 이름 예 `shindong-data-center`
+   - **SDK = Docker**(빈 템플릿), **Private** 권장 → Create.
+
+4. **Space에 코드 올리기** (아래 파일들을 Space 저장소에 push)
+   - `Dockerfile`, `server.py`, `hf_sync.py`, `index.html`
+   - `SPACE_README.md` → **`README.md`로 이름 바꿔서** 올림 (맨 위 YAML이 Space 설정).
+   ```bash
+   git clone https://huggingface.co/spaces/<사용자명>/shindong-data-center hf_space
+   cd hf_space
+   cp ../Dockerfile ../server.py ../hf_sync.py ../index.html .
+   cp ../SPACE_README.md README.md
+   git add . && git commit -m "deploy" && git push
+   ```
+   - push 시 사용자명 + **토큰**(비번 대신)을 입력.
+
+5. **Space Secrets 설정** (Settings → Variables and secrets → New secret)
+   - `DC_PASSWORD` = 로그인 비밀번호 (예: `ShindongDC#2026`)
+   - `HF_TOKEN`    = 1번에서 만든 `hf_...` 토큰
+   - `HF_REPO_ID`  = `사용자명/shindong-dc-data`
+   - 저장하면 Space가 자동 재빌드 → 1~2분 후 `https://<사용자명>-shindong-data-center.hf.space` 접속.
+
+**동작 방식**: 시작 시 Dataset에서 데이터 복원 → 업로드/수정/삭제할 때마다 Dataset에 커밋.
+즉 Space가 슬립/재시작해도 자료는 안 사라집니다. (48시간 무접속 시 슬립하지만 접속하면 깨어남.)
+
+---
+
 ## 방법 A. Render (추천)
 
 1. https://render.com 가입 (GitHub로 로그인 가능).
