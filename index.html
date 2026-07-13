@@ -96,6 +96,21 @@
     font-size: 14px; opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 100; }
   .toast.show { opacity: 1; }
   .toast.err { border-color: var(--danger); color: var(--danger); }
+
+  /* 활동 로그 */
+  .logtable { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .logtable th, .logtable td { padding: 7px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  .logtable th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  .logtable td.detail { white-space: normal; word-break: break-all; max-width: 260px; }
+  .act { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 600; background: var(--panel2); }
+  .act.visit { color: var(--accent); } .act.upload { color: var(--accent2); }
+  .act.download, .act.preview { color: var(--skill); }
+  .act.delete, .act.login_fail { color: var(--danger); }
+  .logsum { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .logsum .chip { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; font-size: 12px; }
+  .logsum .chip b { font-size: 13px; }
+  .logsum .chip .sub2 { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -124,6 +139,7 @@
       <option value="name">이름순</option>
       <option value="size">용량순</option>
     </select>
+    <button class="btn secondary" id="logBtn">📊 로그</button>
     <button class="btn" id="uploadBtn">＋ 업로드</button>
   </div>
 
@@ -182,6 +198,33 @@
     <div class="modal-actions">
       <button class="btn secondary" id="eCancelBtn">취소</button>
       <button class="btn" id="eSaveBtn">저장</button>
+    </div>
+  </div>
+</div>
+
+<!-- 활동 로그 모달 -->
+<div class="overlay" id="logOverlay">
+  <div class="modal" style="max-width:880px">
+    <h2>📊 활동 로그 <span style="font-size:12px;color:var(--muted);font-weight:400">누가 접속·업로드·다운로드했는지 기록</span></h2>
+    <div class="logsum" id="logSummary"></div>
+    <div class="toolbar" style="margin-bottom:12px">
+      <select id="logAction">
+        <option value="">전체 활동</option>
+        <option value="visit">방문</option>
+        <option value="login">로그인</option>
+        <option value="login_fail">로그인 실패</option>
+        <option value="upload">업로드</option>
+        <option value="download">다운로드</option>
+        <option value="preview">미리보기</option>
+        <option value="update">편집</option>
+        <option value="delete">삭제</option>
+      </select>
+      <input type="text" id="logUser" placeholder="이름 필터" style="flex:0 0 140px;min-width:140px">
+      <button class="btn secondary" id="logRefreshBtn">새로고침</button>
+    </div>
+    <div style="max-height:50vh;overflow:auto" id="logTable"></div>
+    <div class="modal-actions">
+      <button class="btn secondary" id="logCloseBtn">닫기</button>
     </div>
   </div>
 </div>
@@ -317,6 +360,43 @@ async function delItem(id) {
   await fetch("/api/items/" + id, { method: "DELETE" });
   toast("삭제되었습니다."); refresh();
 }
+
+// ---- 활동 로그 ----
+const ACT_LBL = { login:"로그인", login_fail:"로그인 실패", visit:"방문", upload:"업로드",
+  download:"다운로드", preview:"미리보기", update:"편집", delete:"삭제", logout:"로그아웃" };
+const fmtDT = iso => { try { return new Date(iso).toLocaleString("ko-KR",
+  {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}); } catch { return iso; } };
+
+async function loadLogs() {
+  const q = new URLSearchParams({
+    action: $("#logAction").value, user: $("#logUser").value.trim(), limit: 300,
+  });
+  const d = await api("/api/logs?" + q);
+  $("#logSummary").innerHTML = d.summary.map(s => `
+    <div class="chip"><b>${esc(s.user || "?")}</b>
+      <span class="sub2"> · 방문 ${s.visits} · 업로드 ${s.uploads} · 다운로드 ${s.downloads}<br>마지막 활동 ${fmtDT(s.last_seen)}</span>
+    </div>`).join("") +
+    (d.login_fails ? `<div class="chip" style="border-color:var(--danger)"><b style="color:var(--danger)">로그인 실패 ${d.login_fails}회</b></div>` : "");
+  if (!d.logs.length) {
+    $("#logTable").innerHTML = `<div class="empty">기록이 없습니다.</div>`;
+    return;
+  }
+  $("#logTable").innerHTML = `<table class="logtable">
+    <tr><th>시간</th><th>이름</th><th>활동</th><th>대상</th><th>IP</th></tr>` +
+    d.logs.map(l => `<tr>
+      <td>${fmtDT(l.ts)}</td>
+      <td><b>${esc(l.user || "?")}</b></td>
+      <td><span class="act ${l.action}">${ACT_LBL[l.action] || esc(l.action)}</span></td>
+      <td class="detail">${esc(l.detail || "")}</td>
+      <td style="color:var(--muted)">${esc(l.ip || "")}</td>
+    </tr>`).join("") + `</table>`;
+}
+$("#logBtn").onclick = () => { $("#logOverlay").classList.add("show"); loadLogs(); };
+$("#logCloseBtn").onclick = () => $("#logOverlay").classList.remove("show");
+$("#logOverlay").onclick = e => { if (e.target === $("#logOverlay")) $("#logOverlay").classList.remove("show"); };
+$("#logRefreshBtn").onclick = loadLogs;
+$("#logAction").onchange = loadLogs;
+let lt; $("#logUser").oninput = () => { clearTimeout(lt); lt = setTimeout(loadLogs, 300); };
 
 // ---- 이벤트 ----
 $("#uploadBtn").onclick = openUpload;

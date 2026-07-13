@@ -9,9 +9,12 @@
 import os
 import io
 import json
+import time
+import hmac
 import sqlite3
 import hashlib
 import mimetypes
+import threading
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +44,12 @@ def auth_token():
     return hashlib.sha256((AUTH_SALT + PASSWORD).encode("utf-8")).hexdigest()
 
 
+def sign_user(name):
+    """이름 쿠키 위조 방지용 서명 (비밀번호를 아는 사람만 유효한 서명 생성 가능)."""
+    key = (AUTH_SALT + PASSWORD).encode("utf-8")
+    return hmac.new(key, name.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
 LOGIN_HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>로그인 · Shindong Data Center</title>
@@ -52,7 +61,7 @@ LOGIN_HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8">
  h1{{font-size:18px;text-align:center;margin:10px 0 4px}}
  .sub{{color:#8b98a5;font-size:12px;text-align:center;margin-bottom:22px}}
  input{{width:100%;box-sizing:border-box;background:#1e2730;border:1px solid #2a343f;color:#e6edf3;
-  padding:11px 12px;border-radius:8px;font-size:14px;outline:none}}
+  padding:11px 12px;border-radius:8px;font-size:14px;outline:none;margin-bottom:10px}}
  input:focus{{border-color:#4493f8}}
  button{{width:100%;margin-top:12px;background:#4493f8;color:#fff;border:none;padding:11px;
   border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}}
@@ -61,8 +70,9 @@ LOGIN_HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8">
 <form class="box" method="POST" action="/api/login">
  <div class="logo">🗄️</div>
  <h1>Shindong Data Center</h1>
- <div class="sub">접근하려면 비밀번호를 입력하세요</div>
- <input type="password" name="password" placeholder="비밀번호" autofocus>
+ <div class="sub">이름과 비밀번호를 입력하세요</div>
+ <input type="text" name="username" placeholder="이름 (예: 김원우)" maxlength="40" autofocus>
+ <input type="password" name="password" placeholder="비밀번호">
  <button type="submit">로그인</button>
  <div class="err">{error}</div>
 </form></body></html>"""
@@ -72,6 +82,7 @@ LOGIN_HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8">
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")  # 동시 요청 시 잠금 대기
     return conn
 
 
@@ -91,6 +102,20 @@ def init_db():
             size        INTEGER NOT NULL DEFAULT 0,
             sha256      TEXT NOT NULL DEFAULT '',
             created_at  TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_log (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts      TEXT NOT NULL,                  -- 발생 시각 (로컬 ISO)
+            user    TEXT NOT NULL DEFAULT '',       -- 로그인 시 입력한 이름
+            ip      TEXT NOT NULL DEFAULT '',       -- X-Forwarded-For 우선
+            action  TEXT NOT NULL,                  -- login|login_fail|visit|upload|download|preview|update|delete|logout
+            item_id INTEGER,                        -- 관련 자료 ID (있으면)
+            detail  TEXT NOT NULL DEFAULT '',       -- 파일명 등 부가 정보
+            ua      TEXT NOT NULL DEFAULT ''        -- User-Agent
         )
         """
     )
@@ -114,6 +139,30 @@ def human_size(n):
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} PB"
+
+
+# ---------------------- log backup (HF) -----------------------
+# 방문/다운로드 로그는 업로드/삭제처럼 매번 커밋하면 과하므로,
+# 변경 표시(dirty)만 해두고 백그라운드 스레드가 10분 주기로 DB를 백업한다.
+_log_dirty = threading.Event()
+
+
+def mark_log_dirty():
+    _log_dirty.set()
+
+
+def start_log_backup_thread(interval_sec=600):
+    if not hf_sync.enabled():
+        return
+
+    def loop():
+        while True:
+            time.sleep(interval_sec)
+            if _log_dirty.is_set():
+                _log_dirty.clear()
+                hf_sync.commit(adds=[(DB_PATH, "datacenter.db")], msg="access log sync")
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 # --------------------------- handler --------------------------
@@ -157,10 +206,57 @@ class Handler(BaseHTTPRequestHandler):
                     return v
         return None
 
+    def current_user(self):
+        """서명 검증된 로그인 이름. 로컬 무인증 모드는 'local'."""
+        if not PASSWORD:
+            return "local"
+        raw = self._get_cookie("dc_user") or ""
+        if "." not in raw:
+            return ""
+        quoted, sig = raw.rsplit(".", 1)
+        name = urllib.parse.unquote(quoted)
+        if name and hmac.compare_digest(sig, sign_user(name)):
+            return name
+        return ""
+
+    def client_ip(self):
+        # HF Spaces/터널 등 프록시 뒤에서는 X-Forwarded-For의 첫 값이 실제 접속자
+        fwd = self.headers.get("X-Forwarded-For", "") or ""
+        if fwd:
+            return fwd.split(",")[0].strip()
+        return self.client_address[0]
+
+    def log_event(self, action, item_id=None, detail=""):
+        """활동 로그 기록. 로깅 실패가 본 기능을 막지 않도록 예외는 삼킨다."""
+        try:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO access_log (ts, user, ip, action, item_id, detail, ua) VALUES (?,?,?,?,?,?,?)",
+                (
+                    now_iso(),
+                    self.current_user(),
+                    self.client_ip(),
+                    action,
+                    item_id,
+                    (detail or "")[:300],
+                    (self.headers.get("User-Agent", "") or "")[:200],
+                ),
+            )
+            # 무한 증가 방지: 최근 20,000건만 유지
+            conn.execute(
+                "DELETE FROM access_log WHERE id <= (SELECT COALESCE(MAX(id),0) FROM access_log) - 20000"
+            )
+            conn.commit()
+            conn.close()
+            mark_log_dirty()
+        except Exception as exc:
+            print(f"[log] 기록 실패: {exc}")
+
     def is_authed(self):
         if not PASSWORD:
             return True
-        return self._get_cookie("dc_auth") == auth_token()
+        # 비밀번호 + 서명된 이름 쿠키가 모두 있어야 인증 (이름 없는 구버전 세션은 재로그인)
+        return self._get_cookie("dc_auth") == auth_token() and bool(self.current_user())
 
     def login_page(self, error=""):
         body = LOGIN_HTML.format(error=error).encode("utf-8")
@@ -171,22 +267,50 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
         data = urllib.parse.parse_qs(raw)
         pwd = (data.get("password", [""])[0] or "")
+        name = (data.get("username", [""])[0] or "").strip()[:40]
         if PASSWORD and pwd == PASSWORD:
+            if not name:
+                return self.login_page(error="이름을 입력하세요.")
+            user_cookie = f"{urllib.parse.quote(name)}.{sign_user(name)}"
             self.send_response(302)
             self.send_header("Location", "/")
             self.send_header(
                 "Set-Cookie",
                 f"dc_auth={auth_token()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
             )
+            self.send_header(
+                "Set-Cookie",
+                f"dc_user={user_cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
+            )
             self.send_header("Content-Length", "0")
             self.end_headers()
+            # 쿠키가 응답에 실리므로 current_user()가 아직 빈 값 → 이름을 직접 기록
+            self._log_as(name, "login")
         else:
+            self._log_as(name or "?", "login_fail")
             self.login_page(error="비밀번호가 올바르지 않습니다.")
 
+    def _log_as(self, name, action, detail=""):
+        """current_user 쿠키가 아직 없는 시점(로그인 직후/실패)용 기록."""
+        try:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO access_log (ts, user, ip, action, item_id, detail, ua) VALUES (?,?,?,?,?,?,?)",
+                (now_iso(), name, self.client_ip(), action, None, detail,
+                 (self.headers.get("User-Agent", "") or "")[:200]),
+            )
+            conn.commit()
+            conn.close()
+            mark_log_dirty()
+        except Exception as exc:
+            print(f"[log] 기록 실패: {exc}")
+
     def logout(self):
+        self.log_event("logout")
         self.send_response(302)
         self.send_header("Location", "/login")
         self.send_header("Set-Cookie", "dc_auth=; Path=/; Max-Age=0")
+        self.send_header("Set-Cookie", "dc_user=; Path=/; Max-Age=0")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -229,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect("/login")
 
         if path == "/" or path == "/index.html":
+            self.log_event("visit")
             return self._send_file(INDEX_PATH, "text/html; charset=utf-8")
 
         if path == "/api/items":
@@ -236,6 +361,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/stats":
             return self.api_stats()
+
+        if path == "/api/logs":
+            return self.api_logs(qs)
 
         if path.startswith("/api/download/"):
             return self.api_file(path.rsplit("/", 1)[-1], inline=False)
@@ -342,6 +470,55 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
 
+    def api_logs(self, qs):
+        action = (qs.get("action", [""])[0] or "").strip()
+        user = (qs.get("user", [""])[0] or "").strip()
+        try:
+            limit = min(max(int(qs.get("limit", ["200"])[0]), 1), 1000)
+        except ValueError:
+            limit = 200
+
+        where, params = [], []
+        if action:
+            where.append("action = ?")
+            params.append(action)
+        if user:
+            where.append("user LIKE ?")
+            params.append(f"%{user}%")
+        sql = "SELECT * FROM access_log"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        conn = get_db()
+        rows = conn.execute(sql, params).fetchall()
+        # 사용자별 요약: 마지막 활동 시각 + 방문/업로드/다운로드 횟수
+        summary = conn.execute(
+            """
+            SELECT user,
+                   MAX(ts) last_seen,
+                   SUM(CASE WHEN action='visit' THEN 1 ELSE 0 END) visits,
+                   SUM(CASE WHEN action='upload' THEN 1 ELSE 0 END) uploads,
+                   SUM(CASE WHEN action IN ('download','preview') THEN 1 ELSE 0 END) downloads,
+                   COUNT(*) total
+            FROM access_log
+            WHERE action != 'login_fail'
+            GROUP BY user ORDER BY last_seen DESC
+            """
+        ).fetchall()
+        fails = conn.execute(
+            "SELECT COUNT(*) c FROM access_log WHERE action='login_fail'"
+        ).fetchone()["c"]
+        conn.close()
+        return self._send_json(
+            {
+                "logs": [row_to_dict(r) for r in rows],
+                "summary": [row_to_dict(r) for r in summary],
+                "login_fails": fails,
+            }
+        )
+
     def api_upload(self, qs):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -390,6 +567,7 @@ class Handler(BaseHTTPRequestHandler):
         new_id = cur.lastrowid
         conn.close()
         # 영구 백업: 새 파일 + 갱신된 DB를 한 커밋으로 반영
+        self.log_event("upload", item_id=new_id, detail=f"{filename} ({human_size(written)})")
         hf_sync.commit(
             adds=[(stored_path, f"storage/{stored_name}"), (DB_PATH, "datacenter.db")],
             msg=f"upload: {filename}",
@@ -422,6 +600,7 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute(f"UPDATE items SET {sets} WHERE id=?", params)
         conn.commit()
         conn.close()
+        self.log_event("update", item_id=item_id, detail=fields.get("title", ""))
         # 메타데이터만 바뀌므로 DB만 백업
         hf_sync.commit(adds=[(DB_PATH, "datacenter.db")], msg=f"update: #{item_id}")
         return self._send_json({"ok": True})
@@ -438,6 +617,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"error": "항목 없음"}, 404)
         path = os.path.join(STORAGE_DIR, row["stored_name"])
         ctype = mimetypes.guess_type(row["filename"])[0] or "application/octet-stream"
+        self.log_event("preview" if inline else "download", item_id=item_id, detail=row["filename"])
         return self._send_file(path, ctype, download_name=row["filename"], inline=inline)
 
     def api_delete(self, item_id):
@@ -459,6 +639,7 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("DELETE FROM items WHERE id=?", (item_id,))
         conn.commit()
         conn.close()
+        self.log_event("delete", item_id=item_id, detail=row["filename"])
         # 영구 백업: 원격 파일 삭제 + 갱신된 DB를 한 커밋으로 반영
         hf_sync.commit(
             adds=[(DB_PATH, "datacenter.db")],
@@ -475,6 +656,7 @@ def main():
         hf_sync.restore(DATA_DIR)
         os.makedirs(STORAGE_DIR, exist_ok=True)
     init_db()
+    start_log_backup_thread()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
     print("=" * 50)
