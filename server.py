@@ -444,7 +444,7 @@ class Handler(BaseHTTPRequestHandler):
         params = []
         if not self.is_admin():
             where.append("hidden = 0")
-        if category in ("raw", "skill"):
+        if category in ("raw", "skill", "skeleton"):
             where.append("category = ?")
             params.append(category)
         if search:
@@ -485,6 +485,7 @@ class Handler(BaseHTTPRequestHandler):
         total = conn.execute(f"SELECT COUNT(*) c, COALESCE(SUM(size),0) s FROM items WHERE 1=1{vis}").fetchone()
         raw = conn.execute(f"SELECT COUNT(*) c FROM items WHERE category='raw'{vis}").fetchone()
         skill = conn.execute(f"SELECT COUNT(*) c FROM items WHERE category='skill'{vis}").fetchone()
+        skeleton = conn.execute(f"SELECT COUNT(*) c FROM items WHERE category='skeleton'{vis}").fetchone()
         hidden = conn.execute("SELECT COUNT(*) c FROM items WHERE hidden=1").fetchone()
         tagrows = conn.execute(f"SELECT tags FROM items WHERE 1=1{vis}").fetchall()
         conn.close()
@@ -502,6 +503,7 @@ class Handler(BaseHTTPRequestHandler):
                 "total_size_human": human_size(total["s"]),
                 "raw": raw["c"],
                 "skill": skill["c"],
+                "skeleton": skeleton["c"],
                 "hidden": (hidden["c"] if self.is_admin() else 0),
                 "tags": [{"name": k, "count": v} for k, v in top_tags],
             }
@@ -570,7 +572,7 @@ class Handler(BaseHTTPRequestHandler):
         filename = os.path.basename(filename) or "upload.bin"
         title = urllib.parse.unquote(g("title")) or filename
         category = g("category", "raw")
-        if category not in ("raw", "skill"):
+        if category not in ("raw", "skill", "skeleton"):
             category = "raw"
         tags = urllib.parse.unquote(g("tags"))
         description = urllib.parse.unquote(g("description"))
@@ -628,7 +630,7 @@ class Handler(BaseHTTPRequestHandler):
             v = g(k)
             if v is not None:
                 fields[k] = v
-        if "category" in fields and fields["category"] not in ("raw", "skill"):
+        if "category" in fields and fields["category"] not in ("raw", "skill", "skeleton"):
             fields["category"] = "raw"
         # 숨김 토글은 관리자만
         hv = g("hidden")

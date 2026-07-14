@@ -8,7 +8,7 @@
   :root {
     --bg: #0f1419; --panel: #171e26; --panel2: #1e2730; --border: #2a343f;
     --text: #e6edf3; --muted: #8b98a5; --accent: #4493f8; --accent2: #2ea043;
-    --skill: #bc8cff; --raw: #4493f8; --danger: #f85149; --radius: 10px;
+    --skill: #bc8cff; --raw: #4493f8; --skeleton: #39c5cf; --danger: #f85149; --radius: 10px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: "Segoe UI", "Malgun Gothic", system-ui, sans-serif;
@@ -23,7 +23,7 @@
     display: grid; place-items: center; font-size: 20px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
 
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 22px; }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 22px; }
   .stat { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
   .stat .num { font-size: 24px; font-weight: 700; }
   .stat .lbl { color: var(--muted); font-size: 12px; margin-top: 2px; }
@@ -54,6 +54,7 @@
   .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 600; }
   .badge.raw { background: rgba(68,147,248,.15); color: var(--raw); }
   .badge.skill { background: rgba(188,140,255,.15); color: var(--skill); }
+  .badge.skeleton { background: rgba(57,197,207,.15); color: var(--skeleton); }
   .badge.hid { background: rgba(240,136,62,.15); color: #f0883e; }
   .chkline { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); cursor: pointer; }
   .chkline input { width: 16px; height: 16px; accent-color: #f0883e; }
@@ -135,6 +136,7 @@
       <button data-cat="" class="active">전체</button>
       <button data-cat="raw">RAW</button>
       <button data-cat="skill">Skill</button>
+      <button data-cat="skeleton">Skeleton</button>
     </div>
     <select id="sort">
       <option value="new">최신순</option>
@@ -165,6 +167,7 @@
       <select id="mCategory">
         <option value="raw">RAW 데이터</option>
         <option value="skill">Skill (Claude 생성)</option>
+        <option value="skeleton">Skeleton (앱 뼈대)</option>
       </select>
     </div>
     <div class="field">
@@ -196,7 +199,7 @@
     <h2>자료 편집</h2>
     <input type="hidden" id="eId">
     <div class="field"><label>분류</label>
-      <select id="eCategory"><option value="raw">RAW 데이터</option><option value="skill">Skill (Claude 생성)</option></select>
+      <select id="eCategory"><option value="raw">RAW 데이터</option><option value="skill">Skill (Claude 생성)</option><option value="skeleton">Skeleton (앱 뼈대)</option></select>
     </div>
     <div class="field"><label>제목</label><input type="text" id="eTitle"></div>
     <div class="field"><label>태그 (쉼표 구분)</label><input type="text" id="eTags"></div>
@@ -261,7 +264,8 @@ const EXT_ICON = {
   txt:"📄", md:"📝", json:"🔧", py:"🐍", js:"📜", ts:"📜", sh:"⚙️", zip:"🗜️",
   png:"🖼️", jpg:"🖼️", jpeg:"🖼️", gif:"🖼️", webp:"🖼️", mp4:"🎬", mp3:"🎵",
 };
-const icon = (ext, cat) => cat === "skill" ? "✨" : (EXT_ICON[(ext||"").toLowerCase()] || "📦");
+const icon = (ext, cat) => cat === "skill" ? "✨" : cat === "skeleton" ? "🏗️" : (EXT_ICON[(ext||"").toLowerCase()] || "📦");
+const CAT_LBL = { raw: "RAW", skill: "Skill", skeleton: "Skeleton" };
 
 function toast(msg, isErr) {
   const t = $("#toast"); t.textContent = msg; t.className = "toast show" + (isErr ? " err" : "");
@@ -274,6 +278,7 @@ async function loadStats() {
     <div class="stat"><div class="num">${s.total}</div><div class="lbl">전체 자료${isAdmin && s.hidden ? ` · 🔒 숨김 ${s.hidden}` : ""}</div></div>
     <div class="stat"><div class="num" style="color:var(--raw)">${s.raw}</div><div class="lbl">RAW 데이터</div></div>
     <div class="stat"><div class="num" style="color:var(--skill)">${s.skill}</div><div class="lbl">Skill</div></div>
+    <div class="stat"><div class="num" style="color:var(--skeleton)">${s.skeleton || 0}</div><div class="lbl">Skeleton</div></div>
     <div class="stat"><div class="num">${s.total_size_human}</div><div class="lbl">총 용량</div></div>`;
 }
 
@@ -295,7 +300,7 @@ async function loadList() {
           <div class="title">${esc(it.title)}</div>
           <div class="meta">${esc(it.filename)} · ${it.size_human} · ${fmtDate(it.created_at)}</div>
         </div>
-        <span class="badge ${it.category}">${it.category === "skill" ? "Skill" : "RAW"}</span>${it.hidden ? `<span class="badge hid">🔒 숨김</span>` : ""}
+        <span class="badge ${it.category}">${CAT_LBL[it.category] || "RAW"}</span>${it.hidden ? `<span class="badge hid">🔒 숨김</span>` : ""}
       </div>
       ${it.tag_list.length ? `<div class="tags">${it.tag_list.map(t => `<span class="tag" onclick="filterTag('${esc(t)}')">#${esc(t)}</span>`).join("")}</div>` : ""}
       ${it.description ? `<div class="desc">${esc(it.description)}</div>` : ""}
