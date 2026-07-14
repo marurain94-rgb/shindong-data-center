@@ -35,6 +35,8 @@ MAX_UPLOAD = 1024 * 1024 * 1024  # 1GB
 # DC_PASSWORD가 설정되면 로그인 인증을 요구한다 (공개 배포 시 필수).
 # 미설정(로컬)이면 인증 없이 바로 사용.
 PASSWORD = os.environ.get("DC_PASSWORD", "")
+# DC_ADMIN_PASSWORD로 로그인하면 관리자(admin) 역할 — 숨김 자료 열람/관리 가능.
+ADMIN_PASSWORD = os.environ.get("DC_ADMIN_PASSWORD", "")
 AUTH_SALT = "shindong-data-center-v1"
 
 os.makedirs(STORAGE_DIR, exist_ok=True)
@@ -44,10 +46,11 @@ def auth_token():
     return hashlib.sha256((AUTH_SALT + PASSWORD).encode("utf-8")).hexdigest()
 
 
-def sign_user(name):
-    """이름 쿠키 위조 방지용 서명 (비밀번호를 아는 사람만 유효한 서명 생성 가능)."""
-    key = (AUTH_SALT + PASSWORD).encode("utf-8")
-    return hmac.new(key, name.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+def sign_user(payload):
+    """세션 쿠키 위조 방지용 서명. payload는 '이름|역할' 문자열.
+    관리자 비밀번호까지 키에 포함해 일반 사용자가 admin 서명을 위조할 수 없게 한다."""
+    key = (AUTH_SALT + PASSWORD + "|" + ADMIN_PASSWORD).encode("utf-8")
+    return hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
 
 
 LOGIN_HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8">
@@ -105,6 +108,10 @@ def init_db():
         )
         """
     )
+    # 마이그레이션: 숨김(관리자 전용) 플래그
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
+    if "hidden" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS access_log (
@@ -206,18 +213,29 @@ class Handler(BaseHTTPRequestHandler):
                     return v
         return None
 
-    def current_user(self):
-        """서명 검증된 로그인 이름. 로컬 무인증 모드는 'local'."""
+    def _session(self):
+        """서명 검증된 (이름, 역할). 로컬 무인증 모드는 ('local','admin')."""
         if not PASSWORD:
-            return "local"
+            return "local", "admin"
         raw = self._get_cookie("dc_user") or ""
         if "." not in raw:
-            return ""
+            return "", ""
         quoted, sig = raw.rsplit(".", 1)
-        name = urllib.parse.unquote(quoted)
-        if name and hmac.compare_digest(sig, sign_user(name)):
-            return name
-        return ""
+        payload = urllib.parse.unquote(quoted)  # '이름|역할'
+        if "|" not in payload:
+            return "", ""
+        if not hmac.compare_digest(sig, sign_user(payload)):
+            return "", ""
+        name, role = payload.rsplit("|", 1)
+        if name and role in ("user", "admin"):
+            return name, role
+        return "", ""
+
+    def current_user(self):
+        return self._session()[0]
+
+    def is_admin(self):
+        return self._session()[1] == "admin"
 
     def client_ip(self):
         # HF Spaces/터널 등 프록시 뒤에서는 X-Forwarded-For의 첫 값이 실제 접속자
@@ -268,10 +286,16 @@ class Handler(BaseHTTPRequestHandler):
         data = urllib.parse.parse_qs(raw)
         pwd = (data.get("password", [""])[0] or "")
         name = (data.get("username", [""])[0] or "").strip()[:40]
-        if PASSWORD and pwd == PASSWORD:
+        role = ""
+        if ADMIN_PASSWORD and pwd == ADMIN_PASSWORD:
+            role = "admin"
+        elif PASSWORD and pwd == PASSWORD:
+            role = "user"
+        if role:
             if not name:
                 return self.login_page(error="이름을 입력하세요.")
-            user_cookie = f"{urllib.parse.quote(name)}.{sign_user(name)}"
+            payload = f"{name}|{role}"
+            user_cookie = f"{urllib.parse.quote(payload)}.{sign_user(payload)}"
             self.send_response(302)
             self.send_header("Location", "/")
             self.send_header(
@@ -285,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             # 쿠키가 응답에 실리므로 current_user()가 아직 빈 값 → 이름을 직접 기록
-            self._log_as(name, "login")
+            self._log_as(name, "login", detail=("admin" if role == "admin" else ""))
         else:
             self._log_as(name or "?", "login_fail")
             self.login_page(error="비밀번호가 올바르지 않습니다.")
@@ -359,10 +383,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/items":
             return self.api_list(qs)
 
+        if path == "/api/me":
+            name, role = self._session()
+            return self._send_json({"user": name, "role": role})
+
         if path == "/api/stats":
             return self.api_stats()
 
         if path == "/api/logs":
+            # 활동 로그(다른 사용자의 IP·활동 포함)는 관리자 전용
+            if not self.is_admin():
+                return self._send_json({"error": "forbidden"}, 403)
             return self.api_logs(qs)
 
         if path.startswith("/api/download/"):
@@ -411,6 +442,8 @@ class Handler(BaseHTTPRequestHandler):
 
         where = []
         params = []
+        if not self.is_admin():
+            where.append("hidden = 0")
         if category in ("raw", "skill"):
             where.append("category = ?")
             params.append(category)
@@ -446,11 +479,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json({"items": items, "count": len(items)})
 
     def api_stats(self):
+        # 일반 사용자 통계에는 숨김 자료가 잡히지 않도록 제외
+        vis = "" if self.is_admin() else " AND hidden = 0"
         conn = get_db()
-        total = conn.execute("SELECT COUNT(*) c, COALESCE(SUM(size),0) s FROM items").fetchone()
-        raw = conn.execute("SELECT COUNT(*) c FROM items WHERE category='raw'").fetchone()
-        skill = conn.execute("SELECT COUNT(*) c FROM items WHERE category='skill'").fetchone()
-        tagrows = conn.execute("SELECT tags FROM items").fetchall()
+        total = conn.execute(f"SELECT COUNT(*) c, COALESCE(SUM(size),0) s FROM items WHERE 1=1{vis}").fetchone()
+        raw = conn.execute(f"SELECT COUNT(*) c FROM items WHERE category='raw'{vis}").fetchone()
+        skill = conn.execute(f"SELECT COUNT(*) c FROM items WHERE category='skill'{vis}").fetchone()
+        hidden = conn.execute("SELECT COUNT(*) c FROM items WHERE hidden=1").fetchone()
+        tagrows = conn.execute(f"SELECT tags FROM items WHERE 1=1{vis}").fetchall()
         conn.close()
         tagset = {}
         for tr in tagrows:
@@ -466,6 +502,7 @@ class Handler(BaseHTTPRequestHandler):
                 "total_size_human": human_size(total["s"]),
                 "raw": raw["c"],
                 "skill": skill["c"],
+                "hidden": (hidden["c"] if self.is_admin() else 0),
                 "tags": [{"name": k, "count": v} for k, v in top_tags],
             }
         )
@@ -537,6 +574,8 @@ class Handler(BaseHTTPRequestHandler):
             category = "raw"
         tags = urllib.parse.unquote(g("tags"))
         description = urllib.parse.unquote(g("description"))
+        # 숨김 업로드는 관리자만 가능 (일반 사용자가 지정해도 무시)
+        hidden = 1 if (g("hidden") in ("1", "true") and self.is_admin()) else 0
         ext = os.path.splitext(filename)[1].lower().lstrip(".")
 
         # 본문(파일 바이트) 읽기 + sha256
@@ -559,9 +598,9 @@ class Handler(BaseHTTPRequestHandler):
         conn = get_db()
         cur = conn.execute(
             """INSERT INTO items
-               (title, category, tags, description, filename, stored_name, ext, size, sha256, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (title, category, tags, description, filename, stored_name, ext, written, h.hexdigest(), now_iso()),
+               (title, category, tags, description, filename, stored_name, ext, size, sha256, created_at, hidden)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (title, category, tags, description, filename, stored_name, ext, written, h.hexdigest(), now_iso(), hidden),
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -591,12 +630,24 @@ class Handler(BaseHTTPRequestHandler):
                 fields[k] = v
         if "category" in fields and fields["category"] not in ("raw", "skill"):
             fields["category"] = "raw"
+        # 숨김 토글은 관리자만
+        hv = g("hidden")
+        if hv is not None and self.is_admin():
+            fields["hidden"] = 1 if hv in ("1", "true") else 0
         if not fields:
             return self._send_json({"error": "수정할 항목 없음"}, 400)
 
+        conn = get_db()
+        row = conn.execute("SELECT hidden FROM items WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            conn.close()
+            return self._send_json({"error": "항목 없음"}, 404)
+        # 숨김 자료는 일반 사용자에게 존재 자체를 감춘다
+        if row["hidden"] and not self.is_admin():
+            conn.close()
+            return self._send_json({"error": "항목 없음"}, 404)
         sets = ", ".join(f"{k}=?" for k in fields)
         params = list(fields.values()) + [item_id]
-        conn = get_db()
         conn.execute(f"UPDATE items SET {sets} WHERE id=?", params)
         conn.commit()
         conn.close()
@@ -613,7 +664,7 @@ class Handler(BaseHTTPRequestHandler):
         conn = get_db()
         row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         conn.close()
-        if not row:
+        if not row or (row["hidden"] and not self.is_admin()):
             return self._send_json({"error": "항목 없음"}, 404)
         path = os.path.join(STORAGE_DIR, row["stored_name"])
         ctype = mimetypes.guess_type(row["filename"])[0] or "application/octet-stream"
@@ -627,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"error": "잘못된 ID"}, 400)
         conn = get_db()
         row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
-        if not row:
+        if not row or (row["hidden"] and not self.is_admin()):
             conn.close()
             return self._send_json({"error": "항목 없음"}, 404)
         path = os.path.join(STORAGE_DIR, row["stored_name"])

@@ -54,6 +54,9 @@
   .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 600; }
   .badge.raw { background: rgba(68,147,248,.15); color: var(--raw); }
   .badge.skill { background: rgba(188,140,255,.15); color: var(--skill); }
+  .badge.hid { background: rgba(240,136,62,.15); color: #f0883e; }
+  .chkline { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); cursor: pointer; }
+  .chkline input { width: 16px; height: 16px; accent-color: #f0883e; }
   .tags { display: flex; flex-wrap: wrap; gap: 5px; }
   .tag { font-size: 11px; background: var(--panel2); border: 1px solid var(--border);
     padding: 2px 8px; border-radius: 6px; color: var(--muted); cursor: pointer; }
@@ -176,6 +179,9 @@
       <label>설명</label>
       <textarea id="mDesc" placeholder="간단한 설명 (선택)"></textarea>
     </div>
+    <div class="field" id="mHiddenWrap" style="display:none">
+      <label class="chkline"><input type="checkbox" id="mHidden"> 🔒 숨김 — 관리자만 볼 수 있음</label>
+    </div>
     <div class="progress" id="progress"><div class="bar" id="progressBar"></div></div>
     <div class="modal-actions">
       <button class="btn secondary" id="cancelBtn">취소</button>
@@ -195,6 +201,9 @@
     <div class="field"><label>제목</label><input type="text" id="eTitle"></div>
     <div class="field"><label>태그 (쉼표 구분)</label><input type="text" id="eTags"></div>
     <div class="field"><label>설명</label><textarea id="eDesc"></textarea></div>
+    <div class="field" id="eHiddenWrap" style="display:none">
+      <label class="chkline"><input type="checkbox" id="eHidden"> 🔒 숨김 — 관리자만 볼 수 있음</label>
+    </div>
     <div class="modal-actions">
       <button class="btn secondary" id="eCancelBtn">취소</button>
       <button class="btn" id="eSaveBtn">저장</button>
@@ -234,7 +243,18 @@
 <script>
 const $ = s => document.querySelector(s);
 const api = (p, o) => fetch(p, o).then(r => r.json());
-let curCat = "", files = [];
+let curCat = "", files = [], isAdmin = false;
+
+async function loadMe() {
+  try {
+    const me = await api("/api/me");
+    isAdmin = me.role === "admin";
+  } catch { isAdmin = false; }
+  // 관리자 전용 UI: 숨김 체크박스, 활동 로그 버튼
+  $("#mHiddenWrap").style.display = isAdmin ? "" : "none";
+  $("#eHiddenWrap").style.display = isAdmin ? "" : "none";
+  $("#logBtn").style.display = isAdmin ? "" : "none";
+}
 
 const EXT_ICON = {
   pdf:"📕", doc:"📘", docx:"📘", xls:"📗", xlsx:"📗", csv:"📊", ppt:"📙", pptx:"📙",
@@ -251,7 +271,7 @@ function toast(msg, isErr) {
 async function loadStats() {
   const s = await api("/api/stats");
   $("#stats").innerHTML = `
-    <div class="stat"><div class="num">${s.total}</div><div class="lbl">전체 자료</div></div>
+    <div class="stat"><div class="num">${s.total}</div><div class="lbl">전체 자료${isAdmin && s.hidden ? ` · 🔒 숨김 ${s.hidden}` : ""}</div></div>
     <div class="stat"><div class="num" style="color:var(--raw)">${s.raw}</div><div class="lbl">RAW 데이터</div></div>
     <div class="stat"><div class="num" style="color:var(--skill)">${s.skill}</div><div class="lbl">Skill</div></div>
     <div class="stat"><div class="num">${s.total_size_human}</div><div class="lbl">총 용량</div></div>`;
@@ -275,7 +295,7 @@ async function loadList() {
           <div class="title">${esc(it.title)}</div>
           <div class="meta">${esc(it.filename)} · ${it.size_human} · ${fmtDate(it.created_at)}</div>
         </div>
-        <span class="badge ${it.category}">${it.category === "skill" ? "Skill" : "RAW"}</span>
+        <span class="badge ${it.category}">${it.category === "skill" ? "Skill" : "RAW"}</span>${it.hidden ? `<span class="badge hid">🔒 숨김</span>` : ""}
       </div>
       ${it.tag_list.length ? `<div class="tags">${it.tag_list.map(t => `<span class="tag" onclick="filterTag('${esc(t)}')">#${esc(t)}</span>`).join("")}</div>` : ""}
       ${it.description ? `<div class="desc">${esc(it.description)}</div>` : ""}
@@ -294,7 +314,7 @@ function filterTag(t) { $("#search").value = t; refresh(); }
 function refresh() { loadStats(); loadList(); }
 
 // ---- 업로드 ----
-function openUpload() { files = []; renderFiles(); $("#mTitle").value=""; $("#mTags").value=""; $("#mDesc").value=""; $("#mCategory").value="raw"; $("#progress").className="progress"; $("#overlay").classList.add("show"); }
+function openUpload() { files = []; renderFiles(); $("#mTitle").value=""; $("#mTags").value=""; $("#mDesc").value=""; $("#mCategory").value="raw"; $("#mHidden").checked=false; $("#progress").className="progress"; $("#overlay").classList.add("show"); }
 function closeUpload() { $("#overlay").classList.remove("show"); }
 function renderFiles() {
   $("#filelist").innerHTML = files.map((f,i) => `<div class="f"><span>📎 ${esc(f.name)}</span><span style="color:var(--muted)">${(f.size/1024).toFixed(0)} KB</span></div>`).join("");
@@ -311,6 +331,7 @@ function uploadOne(file, meta) {
     const params = new URLSearchParams({
       title: meta.title || "", category: meta.category,
       tags: meta.tags || "", description: meta.description || "",
+      hidden: meta.hidden ? "1" : "0",
     });
     xhr.open("POST", "/api/upload?" + params);
     xhr.setRequestHeader("X-Filename", encodeURIComponent(file.name));
@@ -324,7 +345,7 @@ function uploadOne(file, meta) {
 
 $("#saveBtn").onclick = async () => {
   if (!files.length) { toast("파일을 선택하세요.", true); return; }
-  const meta = { category: $("#mCategory").value, tags: $("#mTags").value, description: $("#mDesc").value };
+  const meta = { category: $("#mCategory").value, tags: $("#mTags").value, description: $("#mDesc").value, hidden: isAdmin && $("#mHidden").checked };
   const single = files.length === 1;
   $("#progress").className = "progress show"; $("#saveBtn").disabled = true;
   try {
@@ -343,6 +364,7 @@ $("#saveBtn").onclick = async () => {
 function openEdit(it) {
   $("#eId").value = it.id; $("#eCategory").value = it.category;
   $("#eTitle").value = it.title; $("#eTags").value = it.tags; $("#eDesc").value = it.description || "";
+  $("#eHidden").checked = !!it.hidden;
   $("#editOverlay").classList.add("show");
 }
 $("#eSaveBtn").onclick = async () => {
@@ -351,6 +373,7 @@ $("#eSaveBtn").onclick = async () => {
     title: $("#eTitle").value, category: $("#eCategory").value,
     tags: $("#eTags").value, description: $("#eDesc").value,
   });
+  if (isAdmin) params.set("hidden", $("#eHidden").checked ? "1" : "0");
   await fetch("/api/update/" + id + "?" + params, { method: "POST" });
   $("#editOverlay").classList.remove("show"); toast("저장되었습니다."); refresh();
 };
@@ -411,7 +434,7 @@ $("#catSeg").querySelectorAll("button").forEach(b => b.onclick = () => {
   b.classList.add("active"); curCat = b.dataset.cat; loadList();
 });
 
-refresh();
+loadMe().then(refresh);
 </script>
 </body>
 </html>
