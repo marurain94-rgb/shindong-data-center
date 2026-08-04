@@ -9,6 +9,7 @@
 import os
 import io
 import json
+import base64
 import time
 import hmac
 import sqlite3
@@ -220,8 +221,13 @@ class Handler(BaseHTTPRequestHandler):
         raw = self._get_cookie("dc_user") or ""
         if "." not in raw:
             return "", ""
-        quoted, sig = raw.rsplit(".", 1)
-        payload = urllib.parse.unquote(quoted)  # '이름|역할'
+        encoded, sig = raw.rsplit(".", 1)
+        # HF Spaces 프록시가 Cookie 헤더의 %XX를 미리 디코딩해 한글 payload가
+        # latin-1 mojibake로 도착하므로, %인코딩 대신 순수 ASCII인 base64를 쓴다.
+        try:
+            payload = base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+        except Exception:
+            return "", ""
         if "|" not in payload:
             return "", ""
         if not hmac.compare_digest(sig, sign_user(payload)):
@@ -295,7 +301,8 @@ class Handler(BaseHTTPRequestHandler):
             if not name:
                 return self.login_page(error="이름을 입력하세요.")
             payload = f"{name}|{role}"
-            user_cookie = f"{urllib.parse.quote(payload)}.{sign_user(payload)}"
+            encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+            user_cookie = f"{encoded}.{sign_user(payload)}"
             self.send_response(302)
             self.send_header("Location", "/")
             self.send_header(
