@@ -186,6 +186,7 @@
       <label class="chkline"><input type="checkbox" id="mHidden"> 🔒 숨김 — 관리자만 볼 수 있음</label>
     </div>
     <div class="progress" id="progress"><div class="bar" id="progressBar"></div></div>
+    <div id="progressText" style="font-size:11px;color:var(--muted);margin-top:4px;text-align:right;min-height:14px"></div>
     <div class="modal-actions">
       <button class="btn secondary" id="cancelBtn">취소</button>
       <button class="btn" id="saveBtn">업로드</button>
@@ -226,6 +227,8 @@
         <option value="login">로그인</option>
         <option value="login_fail">로그인 실패</option>
         <option value="upload">업로드</option>
+        <option value="upload_fail">업로드 실패</option>
+        <option value="client_error">클라이언트 오류</option>
         <option value="download">다운로드</option>
         <option value="preview">미리보기</option>
         <option value="update">편집</option>
@@ -330,22 +333,97 @@ $("#fileInput").onchange = e => { files = [...e.target.files]; renderFiles(); };
 ["dragleave","drop"].forEach(ev => $("#dropzone").addEventListener(ev, e => { e.preventDefault(); $("#dropzone").classList.remove("over"); }));
 $("#dropzone").addEventListener("drop", e => { files = [...e.dataTransfer.files]; renderFiles(); });
 
-function uploadOne(file, meta) {
+// 프록시 경유 업로드가 느리고 도중 끊김에 취약해서, 파일을 4MB 조각으로 나눠
+// 3개씩 병렬 전송하고 조각별로 재시도한다. 메타데이터는 프록시의 %디코딩을
+// 피하려고 base64로 보낸다. 실패하면 원인을 서버 로그로 보고한다.
+const CHUNK_SIZE = 4 * 1024 * 1024, PARALLEL = 3, RETRIES = 3;
+const b64u = s => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+function reportClientError(ctx) {
+  try {
+    navigator.sendBeacon("/api/clientlog", new Blob(
+      [JSON.stringify(ctx).slice(0, 2000)], { type: "text/plain" }));
+  } catch (_) {}
+}
+
+function putChunk(uid, seq, buf, onprog) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    const params = new URLSearchParams({
-      title: meta.title || "", category: meta.category,
-      tags: meta.tags || "", description: meta.description || "",
-      hidden: meta.hidden ? "1" : "0",
-    });
-    xhr.open("POST", "/api/upload?" + params);
-    xhr.setRequestHeader("X-Filename", encodeURIComponent(file.name));
+    xhr.open("POST", `/api/upload_chunk?uid=${uid}&seq=${seq}`);
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
-    xhr.upload.onprogress = e => { if (e.lengthComputable) meta.onprog(e.loaded / e.total); };
-    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300) ? resolve() : reject(new Error("업로드 실패"));
-    xhr.onerror = () => reject(new Error("네트워크 오류"));
-    xhr.send(file);
+    xhr.timeout = 120000;
+    xhr.upload.onprogress = e => onprog(e.loaded);
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else if (xhr.status === 401) reject(new Error("로그인이 만료되었습니다. 새로고침 후 다시 로그인해 주세요."));
+      else reject(new Error("서버 오류 (HTTP " + xhr.status + ")"));
+    };
+    xhr.onerror = () => reject(new Error("네트워크 끊김"));
+    xhr.ontimeout = () => reject(new Error("시간 초과"));
+    xhr.send(buf);
   });
+}
+
+async function uploadOne(file, meta) {
+  try {
+    if (!file.size) throw new Error(`"${file.name}" 은(는) 빈 파일입니다.`);
+    const uid = [...crypto.getRandomValues(new Uint8Array(16))]
+      .map(b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
+    const n = Math.ceil(file.size / CHUNK_SIZE);
+    const done = new Array(n).fill(0);
+    const report = () => meta.onprog(Math.min(1, done.reduce((a, b) => a + b, 0) / file.size));
+    let next = 0;
+    const worker = async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= n) return;
+        const blob = file.slice(i * CHUNK_SIZE, Math.min(file.size, (i + 1) * CHUNK_SIZE));
+        let buf;
+        try { buf = await blob.arrayBuffer(); }
+        catch (e) {
+          throw new Error(`"${file.name}" 파일을 읽을 수 없습니다. 엑셀 등 다른 프로그램에서 열려 있으면 닫고, 파일을 다시 선택해 주세요.`);
+        }
+        let lastErr = null;
+        for (let a = 0; a < RETRIES; a++) {
+          try {
+            await putChunk(uid, i, buf, sent => { done[i] = Math.min(sent, buf.byteLength); report(); });
+            done[i] = buf.byteLength; report(); lastErr = null; break;
+          } catch (e) {
+            lastErr = e;
+            if (/로그인/.test(e.message)) break;
+            await new Promise(r => setTimeout(r, 1500 * (a + 1)));
+          }
+        }
+        if (lastErr) throw new Error(`업로드 실패 (${i + 1}/${n} 조각, ${lastErr.message}). 잠시 후 다시 시도해 주세요.`);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(PARALLEL, n) }, worker));
+
+    const params = new URLSearchParams({
+      uid, n: String(n), size: String(file.size),
+      fn_b64: b64u(file.name), title_b64: b64u(meta.title || ""),
+      category: meta.category, tags_b64: b64u(meta.tags || ""),
+      description_b64: b64u(meta.description || ""), hidden: meta.hidden ? "1" : "0",
+    });
+    let fin = null, finErr = null;
+    for (let a = 0; a < RETRIES; a++) {
+      try {
+        const r = await fetch("/api/upload_finish?" + params, { method: "POST" });
+        fin = await r.json(); finErr = null;
+        if (fin.ok) break;
+        finErr = new Error(fin.error || "저장 실패");
+        if (fin.error !== "missing_chunk") break;
+        for (const i of fin.missing || []) {
+          const blob = file.slice(i * CHUNK_SIZE, Math.min(file.size, (i + 1) * CHUNK_SIZE));
+          await putChunk(uid, i, await blob.arrayBuffer(), () => {});
+        }
+      } catch (e) { finErr = new Error("저장 요청 실패 (" + e.message + ")"); await new Promise(r => setTimeout(r, 1500)); }
+    }
+    if (finErr) throw finErr;
+  } catch (e) {
+    reportClientError({ file: file.name, size: file.size, err: e.message, ua: navigator.userAgent.slice(0, 100) });
+    throw e;
+  }
 }
 
 $("#saveBtn").onclick = async () => {
@@ -355,14 +433,18 @@ $("#saveBtn").onclick = async () => {
   $("#progress").className = "progress show"; $("#saveBtn").disabled = true;
   try {
     for (let i = 0; i < files.length; i++) {
+      const mb = files[i].size / 1048576;
       await uploadOne(files[i], {
         ...meta, title: single ? $("#mTitle").value : "",
-        onprog: p => { $("#progressBar").style.width = ((i + p) / files.length * 100) + "%"; },
+        onprog: p => {
+          $("#progressBar").style.width = ((i + p) / files.length * 100) + "%";
+          $("#progressText").textContent = `${files[i].name} · ${(p * mb).toFixed(1)} / ${mb.toFixed(1)} MB`;
+        },
       });
     }
     toast(`${files.length}개 업로드 완료`); closeUpload(); refresh();
   } catch (e) { toast(e.message, true); }
-  finally { $("#saveBtn").disabled = false; }
+  finally { $("#saveBtn").disabled = false; $("#progressText").textContent = ""; }
 };
 
 // ---- 편집 ----
@@ -375,8 +457,8 @@ function openEdit(it) {
 $("#eSaveBtn").onclick = async () => {
   const id = $("#eId").value;
   const params = new URLSearchParams({
-    title: $("#eTitle").value, category: $("#eCategory").value,
-    tags: $("#eTags").value, description: $("#eDesc").value,
+    title_b64: b64u($("#eTitle").value), category: $("#eCategory").value,
+    tags_b64: b64u($("#eTags").value), description_b64: b64u($("#eDesc").value),
   });
   if (isAdmin) params.set("hidden", $("#eHidden").checked ? "1" : "0");
   await fetch("/api/update/" + id + "?" + params, { method: "POST" });
@@ -391,6 +473,7 @@ async function delItem(id) {
 
 // ---- 활동 로그 ----
 const ACT_LBL = { login:"로그인", login_fail:"로그인 실패", visit:"방문", upload:"업로드",
+  upload_fail:"업로드 실패", client_error:"클라이언트 오류",
   download:"다운로드", preview:"미리보기", update:"편집", delete:"삭제", logout:"로그아웃" };
 const fmtDT = iso => { try { return new Date(iso).toLocaleString("ko-KR",
   {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}); } catch { return iso; } };

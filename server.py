@@ -8,10 +8,12 @@
 """
 import os
 import io
+import re
 import json
 import base64
 import time
 import hmac
+import shutil
 import sqlite3
 import hashlib
 import mimetypes
@@ -32,6 +34,8 @@ INDEX_PATH = os.path.join(BASE_DIR, "index.html")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 MAX_UPLOAD = 1024 * 1024 * 1024  # 1GB
+MAX_CHUNK = 8 * 1024 * 1024 + 1024  # 청크 업로드 조각 상한 (클라이언트는 4MB씩 전송)
+CHUNK_DIR = None  # STORAGE_DIR 확정 후 아래에서 설정
 
 # DC_PASSWORD가 설정되면 로그인 인증을 요구한다 (공개 배포 시 필수).
 # 미설정(로컬)이면 인증 없이 바로 사용.
@@ -41,6 +45,41 @@ ADMIN_PASSWORD = os.environ.get("DC_ADMIN_PASSWORD", "")
 AUTH_SALT = "shindong-data-center-v1"
 
 os.makedirs(STORAGE_DIR, exist_ok=True)
+CHUNK_DIR = os.path.join(STORAGE_DIR, ".chunks")
+
+
+def cleanup_stale_chunks(max_age_sec=24 * 3600):
+    """중단된 청크 업로드 임시 폴더를 정리한다 (24시간 경과분)."""
+    try:
+        if not os.path.isdir(CHUNK_DIR):
+            return
+        cutoff = time.time() - max_age_sec
+        for name in os.listdir(CHUNK_DIR):
+            p = os.path.join(CHUNK_DIR, name)
+            try:
+                if os.path.isdir(p) and os.path.getmtime(p) < cutoff:
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def qs_text(qs, key):
+    """쿼리 파라미터 텍스트 추출.
+
+    HF Spaces 프록시가 URL/헤더의 %XX를 임의로 디코딩하는 문제를 피하려고
+    새 클라이언트는 값을 URL-safe base64로 담은 <key>_b64 파라미터를 보낸다.
+    구버전 호환을 위해 없으면 기존 방식(unquote)으로 읽는다.
+    """
+    v = qs.get(key + "_b64", [None])[0]
+    if v is not None:
+        try:
+            pad = "=" * (-len(v) % 4)
+            return base64.urlsafe_b64decode((v + pad).encode("ascii")).decode("utf-8")
+        except Exception:
+            return ""
+    return urllib.parse.unquote(qs.get(key, [""])[0] or "")
 
 
 def auth_token():
@@ -425,6 +464,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/upload":
             return self.api_upload(qs)
 
+        if path == "/api/upload_chunk":
+            return self.api_upload_chunk(qs)
+
+        if path == "/api/upload_finish":
+            return self.api_upload_finish(qs)
+
+        if path == "/api/clientlog":
+            return self.api_clientlog()
+
         if path.startswith("/api/update/"):
             return self.api_update(path.rsplit("/", 1)[-1], qs)
 
@@ -604,6 +652,18 @@ class Handler(BaseHTTPRequestHandler):
                 written += len(chunk)
                 remaining -= len(chunk)
 
+        # 전송이 중간에 끊겼으면 잘린 파일을 등록하지 않고 흔적만 남긴다
+        if written != length:
+            try:
+                os.remove(stored_path)
+            except OSError:
+                pass
+            self.log_event(
+                "upload_fail",
+                detail=f"{filename} 전송 중단 ({human_size(written)}/{human_size(length)})",
+            )
+            return self._send_json({"error": "전송이 중단되었습니다."}, 400)
+
         conn = get_db()
         cur = conn.execute(
             """INSERT INTO items
@@ -622,6 +682,129 @@ class Handler(BaseHTTPRequestHandler):
         )
         return self._send_json({"ok": True, "id": new_id})
 
+    # ---- 청크 업로드 (프록시 경유 대용량/불안정 회선 대응) ----
+    # 브라우저가 파일을 4MB 조각으로 나눠 병렬 전송하고(조각별 재시도 가능),
+    # 마지막에 upload_finish 로 조립한다. 조각 하나가 끊겨도 그 조각만 다시 보내면 된다.
+    def _chunk_uid(self, qs):
+        uid = (qs.get("uid", [""])[0] or "")
+        return uid if re.fullmatch(r"[A-Za-z0-9_-]{8,40}", uid) else ""
+
+    def api_upload_chunk(self, qs):
+        uid = self._chunk_uid(qs)
+        seq_s = (qs.get("seq", [""])[0] or "")
+        if not uid or not seq_s.isdigit() or int(seq_s) > 99999:
+            return self._send_json({"error": "잘못된 요청"}, 400)
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return self._send_json({"error": "빈 조각입니다."}, 400)
+        if length > MAX_CHUNK:
+            return self._send_json({"error": "조각이 너무 큽니다."}, 413)
+
+        cdir = os.path.join(CHUNK_DIR, uid)
+        os.makedirs(cdir, exist_ok=True)
+        part_path = os.path.join(cdir, f"{int(seq_s):05d}.part")
+        remaining = length
+        written = 0
+        with open(part_path, "wb") as out:
+            while remaining > 0:
+                chunk = self.rfile.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                out.write(chunk)
+                written += len(chunk)
+                remaining -= len(chunk)
+        if written != length:
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+            return self._send_json({"error": "전송이 중단되었습니다."}, 400)
+        return self._send_json({"ok": True, "seq": int(seq_s)})
+
+    def api_upload_finish(self, qs):
+        uid = self._chunk_uid(qs)
+        n_s = (qs.get("n", [""])[0] or "")
+        size_s = (qs.get("size", ["0"])[0] or "0")
+        if not uid or not n_s.isdigit() or not (1 <= int(n_s) <= 100000):
+            return self._send_json({"error": "잘못된 요청"}, 400)
+        n = int(n_s)
+        declared = int(size_s) if size_s.isdigit() else 0
+        if declared > MAX_UPLOAD:
+            return self._send_json({"error": "파일이 너무 큽니다 (최대 1GB)."}, 413)
+
+        cdir = os.path.join(CHUNK_DIR, uid)
+        parts = [os.path.join(cdir, f"{i:05d}.part") for i in range(n)]
+        missing = [i for i, p in enumerate(parts) if not os.path.exists(p)]
+        if missing:
+            # 클라이언트가 누락 조각만 재전송한 뒤 finish 를 다시 호출한다
+            return self._send_json({"error": "missing_chunk", "missing": missing[:10]}, 409)
+
+        filename = os.path.basename(qs_text(qs, "fn")) or "upload.bin"
+        title = qs_text(qs, "title") or filename
+        category = (qs.get("category", ["raw"])[0] or "raw")
+        if category not in ("raw", "skill", "skeleton"):
+            category = "raw"
+        tags = qs_text(qs, "tags")
+        description = qs_text(qs, "description")
+        hidden = 1 if ((qs.get("hidden", [""])[0] in ("1", "true")) and self.is_admin()) else 0
+        ext = os.path.splitext(filename)[1].lower().lstrip(".")
+
+        h = hashlib.sha256()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stored_name = f"{ts}_{filename}"
+        stored_path = os.path.join(STORAGE_DIR, stored_name)
+        total = 0
+        with open(stored_path, "wb") as out:
+            for p in parts:
+                with open(p, "rb") as src:
+                    while True:
+                        chunk = src.read(64 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        h.update(chunk)
+                        total += len(chunk)
+        shutil.rmtree(cdir, ignore_errors=True)
+        cleanup_stale_chunks()
+
+        if declared and total != declared:
+            try:
+                os.remove(stored_path)
+            except OSError:
+                pass
+            self.log_event(
+                "upload_fail",
+                detail=f"{filename} 조립 크기 불일치 ({human_size(total)}/{human_size(declared)})",
+            )
+            return self._send_json({"error": "조립된 파일 크기가 맞지 않습니다. 다시 시도해 주세요."}, 400)
+
+        conn = get_db()
+        cur = conn.execute(
+            """INSERT INTO items
+               (title, category, tags, description, filename, stored_name, ext, size, sha256, created_at, hidden)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (title, category, tags, description, filename, stored_name, ext, total, h.hexdigest(), now_iso(), hidden),
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+        conn.close()
+        self.log_event("upload", item_id=new_id, detail=f"{filename} ({human_size(total)})")
+        hf_sync.commit(
+            adds=[(stored_path, f"storage/{stored_name}"), (DB_PATH, "datacenter.db")],
+            msg=f"upload: {filename}",
+        )
+        return self._send_json({"ok": True, "id": new_id})
+
+    def api_clientlog(self):
+        """브라우저에서 업로드 실패 등 오류를 보고받아 활동 로그에 남긴다.
+        동료 PC에서만 나는 오류를 관리자가 📊 로그에서 확인할 수 있게 한다."""
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = ""
+        if 0 < length <= 4096:
+            raw = self.rfile.read(length).decode("utf-8", "replace")
+        self.log_event("client_error", detail=raw[:300])
+        return self._send_json({"ok": True})
+
     def api_update(self, item_id, qs):
         try:
             item_id = int(item_id)
@@ -629,6 +812,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"error": "잘못된 ID"}, 400)
 
         def g(key):
+            if (key + "_b64") in qs:
+                return qs_text(qs, key)
             v = qs.get(key)
             return urllib.parse.unquote(v[0]) if v else None
 
@@ -716,6 +901,7 @@ def main():
         hf_sync.restore(DATA_DIR)
         os.makedirs(STORAGE_DIR, exist_ok=True)
     init_db()
+    cleanup_stale_chunks()
     start_log_backup_thread()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
